@@ -1,4 +1,3 @@
-using System.Data;
 using FileClassification.Application.Enums;
 using FileClassification.Application.Repositories;
 using FileClassification.Entities;
@@ -8,109 +7,99 @@ using Npgsql;
 
 namespace FileClassification.Infrastructure.Repositories;
 
-#pragma warning disable CS0618 // NpgsqlLargeObjectManager is marked obsolete but still ships and works.
-
-public class FileRepository(AppDbContext db, NpgsqlDataSource dataSource) : IFileRepository
+public class FileRepository(AppDbContext db) : IFileRepository
 {
     public async Task AddAsync(FileRecord file, Stream data, CancellationToken ct = default)
     {
-        await using var transaction = await db.Database.BeginTransactionAsync(ct);
-        var connection = (NpgsqlConnection)db.Database.GetDbConnection();
-        var largeObjects = new NpgsqlLargeObjectManager(connection);
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
 
-        var oid = await largeObjects.CreateAsync(0, ct);
-        await using (var writer = await largeObjects.OpenReadWriteAsync(oid, ct))
-            await data.CopyToAsync(writer, ct);
+        var conn = (NpgsqlConnection)db.Database.GetDbConnection();
+        var lo = new NpgsqlLargeObjectManager(conn);
+
+        var oid = await lo.CreateAsync(0, ct);
+        var loStream = await lo.OpenReadWriteAsync(oid, ct);
+        await data.CopyToAsync(loStream, ct);
+        await loStream.DisposeAsync();  // close LO before SaveChanges touches the connection
 
         file.DataOid = oid;
         db.Files.Add(file);
         await db.SaveChangesAsync(ct);
-        await transaction.CommitAsync(ct);
+
+        await tx.CommitAsync(ct);
     }
 
     public async Task<Stream> OpenReadStreamAsync(uint oid, CancellationToken ct = default)
     {
-        var connection = await dataSource.OpenConnectionAsync(ct);
-        NpgsqlTransaction? transaction = null;
-        try
-        {
-            transaction = await connection.BeginTransactionAsync(ct);
-            var largeObjects = new NpgsqlLargeObjectManager(connection);
-            var stream = await largeObjects.OpenReadAsync(oid, ct);
-            return new LargeObjectReadStream(connection, transaction, stream);
-        }
-        catch
-        {
-            if (transaction is not null) await transaction.DisposeAsync();
-            await connection.DisposeAsync();
-            throw;
-        }
+        var conn = new NpgsqlConnection(db.Database.GetConnectionString());
+        await conn.OpenAsync(ct);
+        var tx = await conn.BeginTransactionAsync(ct);
+        var lo = new NpgsqlLargeObjectManager(conn);
+        var loStream = await lo.OpenReadAsync(oid, ct);
+        return new LargeObjectReadStream(conn, tx, loStream);
     }
 
-    public Task<FileRecord?> GetByIdAsync(int id, CancellationToken ct = default) =>
-        db.Files.AsNoTracking().FirstOrDefaultAsync(f => f.Id == id, ct);
+    public Task<FileRecord?> GetByIdAsync(int id, CancellationToken ct = default)
+    {
+        return db.Files.AsNoTracking().FirstOrDefaultAsync(f => f.Id == id, ct);
+    }
 
-    public async Task<IReadOnlyList<FileRecord>> GetAllAsync(CancellationToken ct = default) =>
-        await db.Files.AsNoTracking().OrderBy(f => f.Id).ToListAsync(ct);
+    public async Task<IReadOnlyList<FileRecord>> GetAllAsync(CancellationToken ct = default)
+    {
+        return await db.Files.AsNoTracking()
+            .OrderBy(f => f.Id)
+            .Select(f => new FileRecord
+            {
+                Id = f.Id,
+                FileName = f.FileName,
+                SizeBytes = f.SizeBytes,
+                State = f.State,
+                Progress = f.Progress,
+                WorkerId = f.WorkerId,
+                Language = f.Language,
+                Score = f.Score,
+                CreatedAt = f.CreatedAt,
+                UpdatedAt = f.UpdatedAt
+            })
+            .ToListAsync(ct);
+    }
 
     public async Task<IReadOnlyList<FileRecord>> ClaimPendingAsync(string workerId, int count, CancellationToken ct = default)
     {
-        const string sql = """
-            UPDATE "Files" f
-            SET "State" = 'Processing', "WorkerId" = @worker, "UpdatedAt" = @now
-            FROM (
-                SELECT "Id" FROM "Files"
-                WHERE "State" = 'Pending'
-                ORDER BY "Id"
-                LIMIT @limit
-                FOR UPDATE SKIP LOCKED
-            ) AS picked
-            WHERE f."Id" = picked."Id"
-            RETURNING f."Id", f."FileName", f."DataOid", f."SizeBytes", f."State",
-                      f."Progress", f."WorkerId", f."Language", f."Score",
-                      f."CreatedAt", f."UpdatedAt";
-            """;
+        var pending = await db.Files
+            .Where(f => f.State == FileState.Pending)
+            .OrderBy(f => f.Id)
+            .Take(count)
+            .ToListAsync(ct);
 
-        var connection = (NpgsqlConnection)db.Database.GetDbConnection();
-        if (connection.State != ConnectionState.Open) await connection.OpenAsync(ct);
-
-        await using var command = new NpgsqlCommand(sql, connection);
-        command.Parameters.AddWithValue("worker", workerId);
-        command.Parameters.AddWithValue("now", DateTime.UtcNow);
-        command.Parameters.AddWithValue("limit", count);
-
-        // Column order matches the RETURNING clause above.
-        var results = new List<FileRecord>(count);
-        await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        var claimed = new List<FileRecord>();
+        foreach (var file in pending)
         {
-            results.Add(new FileRecord
-            {
-                Id = reader.GetInt32(0),
-                FileName = reader.GetString(1),
-                DataOid = reader.GetFieldValue<uint>(2),
-                SizeBytes = reader.GetInt64(3),
-                State = Enum.Parse<FileState>(reader.GetString(4)),
-                Progress = reader.GetDouble(5),
-                WorkerId = reader.IsDBNull(6) ? null : reader.GetString(6),
-                Language = reader.IsDBNull(7) ? null : Enum.Parse<Language>(reader.GetString(7)),
-                Score = reader.IsDBNull(8) ? null : reader.GetDouble(8),
-                CreatedAt = reader.GetDateTime(9),
-                UpdatedAt = reader.GetDateTime(10),
-            });
+            // WHERE Id = @id AND State = 'Pending' ensures only one worker wins the race.
+            var affected = await db.Files
+                .Where(f => f.Id == file.Id && f.State == FileState.Pending)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(f => f.State, FileState.Processing)
+                    .SetProperty(f => f.WorkerId, workerId)
+                    .SetProperty(f => f.UpdatedAt, DateTime.UtcNow), ct);
+
+            if (affected > 0) claimed.Add(file);
         }
-        return results;
+        return claimed;
     }
 
-    public async Task<bool> UpdateProgressAsync(int id, string workerId, double progress, CancellationToken ct = default) =>
-        await db.Files
+    public async Task<bool> UpdateProgressAsync(int id, string workerId, double progress, CancellationToken ct = default)
+    {
+        var affected = await db.Files
             .Where(f => f.Id == id && f.WorkerId == workerId && f.State == FileState.Processing)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(f => f.Progress, progress)
-                .SetProperty(f => f.UpdatedAt, DateTime.UtcNow), ct) > 0;
+                .SetProperty(f => f.UpdatedAt, DateTime.UtcNow), ct);
+        return affected > 0;
+    }
 
-    public Task FinalizeAsync(int id, string workerId, FileState state, Language language, double? score, CancellationToken ct = default) =>
-        db.Files
+    public Task FinalizeAsync(int id, string workerId, FileState state, Language language, double? score, CancellationToken ct = default)
+    {
+        return db.Files
             .Where(f => f.Id == id && f.WorkerId == workerId && f.State == FileState.Processing)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(f => f.Progress, 100.0)
@@ -118,44 +107,57 @@ public class FileRepository(AppDbContext db, NpgsqlDataSource dataSource) : IFil
                 .SetProperty(f => f.Language, language)
                 .SetProperty(f => f.Score, score)
                 .SetProperty(f => f.UpdatedAt, DateTime.UtcNow), ct);
+    }
 
-    public Task<int> ResetStalledAsync(DateTime cutoff, CancellationToken ct = default) =>
-        db.Files
+    public Task<int> ResetStalledAsync(DateTime cutoff, CancellationToken ct = default)
+    {
+        return db.Files
             .Where(f => f.State == FileState.Processing && f.UpdatedAt < cutoff)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(f => f.State, FileState.Pending)
                 .SetProperty(f => f.WorkerId, (string?)null)
                 .SetProperty(f => f.Progress, 0.0)
                 .SetProperty(f => f.UpdatedAt, DateTime.UtcNow), ct);
+    }
 
-    public async Task<bool> CancelAsync(int id, CancellationToken ct = default) =>
-        await db.Files
+    public async Task<bool> CancelAsync(int id, CancellationToken ct = default)
+    {
+        var affected = await db.Files
             .Where(f => f.Id == id && f.State == FileState.Processing)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(f => f.State, FileState.Inactive)
                 .SetProperty(f => f.WorkerId, (string?)null)
                 .SetProperty(f => f.Progress, 0.0)
-                .SetProperty(f => f.UpdatedAt, DateTime.UtcNow), ct) > 0;
+                .SetProperty(f => f.UpdatedAt, DateTime.UtcNow), ct);
+        return affected > 0;
+    }
 
-    public async Task<bool> ResumeAsync(int id, CancellationToken ct = default) =>
-        await db.Files
-            .Where(f => f.Id == id && (f.State == FileState.Inactive || f.State == FileState.Failed))
+    public async Task<bool> ResumeAsync(int id, CancellationToken ct = default)
+    {
+        var affected = await db.Files
+            .Where(f => f.Id == id && f.State == FileState.Inactive)
             .ExecuteUpdateAsync(s => s
                 .SetProperty(f => f.State, FileState.Pending)
                 .SetProperty(f => f.WorkerId, (string?)null)
                 .SetProperty(f => f.Progress, 0.0)
-                .SetProperty(f => f.UpdatedAt, DateTime.UtcNow), ct) > 0;
+                .SetProperty(f => f.UpdatedAt, DateTime.UtcNow), ct);
+        return affected > 0;
+    }
 
     public async Task<bool> DeleteAsync(int id, CancellationToken ct = default)
     {
         var file = await db.Files.AsNoTracking().FirstOrDefaultAsync(f => f.Id == id, ct);
         if (file is null) return false;
 
-        await using var transaction = await db.Database.BeginTransactionAsync(ct);
-        var connection = (NpgsqlConnection)db.Database.GetDbConnection();
-        await new NpgsqlLargeObjectManager(connection).UnlinkAsync(file.DataOid, ct);
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        var conn = (NpgsqlConnection)db.Database.GetDbConnection();
+        var lo = new NpgsqlLargeObjectManager(conn);
+        await lo.UnlinkAsync(file.DataOid, ct);
+
         await db.Files.Where(f => f.Id == id).ExecuteDeleteAsync(ct);
-        await transaction.CommitAsync(ct);
+
+        await tx.CommitAsync(ct);
         return true;
     }
 }

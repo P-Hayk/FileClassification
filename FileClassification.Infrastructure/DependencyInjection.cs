@@ -12,11 +12,8 @@ public static class DependencyInjection
     public static IServiceCollection AddInfrastructureServices(
         this IServiceCollection services, string connectionString)
     {
-        var dataSource = new NpgsqlDataSourceBuilder(connectionString).Build();
-        services.AddSingleton(dataSource);
-
-        services.AddDbContext<AppDbContext>((sp, options) =>
-            options.UseNpgsql(sp.GetRequiredService<NpgsqlDataSource>()));
+        services.AddDbContext<AppDbContext>(options =>
+            options.UseNpgsql(connectionString));
 
         services.AddScoped<IFileRepository, FileRepository>();
         return services;

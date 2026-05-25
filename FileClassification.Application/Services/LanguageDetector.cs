@@ -37,6 +37,7 @@ public class LanguageDetector(IOptions<LanguageDetectorSettings> options) : IFil
 
             if (progress is null || totalBytes <= 0) continue;
             var percent = Math.Round(reader.BaseStream.Position * 100.0 / totalBytes, 1);
+            
             if (percent > lastReportedPercent)
             {
                 progress.Report(percent);

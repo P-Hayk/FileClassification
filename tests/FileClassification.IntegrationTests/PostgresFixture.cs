@@ -43,7 +43,7 @@ public sealed class PostgresFixture : IAsyncLifetime
         return new AppDbContext(options);
     }
 
-    public IFileRepository NewRepository(AppDbContext db) => new FileRepository(db, _dataSource);
+    public IFileRepository NewRepository(AppDbContext db) => new FileRepository(db);
 
     public async Task ResetAsync()
     {
