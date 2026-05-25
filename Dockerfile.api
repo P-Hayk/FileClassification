@@ -1,0 +1,21 @@
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
+
+COPY FileClassification.sln .
+COPY FileClassification.API/FileClassification.API.csproj FileClassification.API/
+COPY FileClassification.Application/FileClassification.Application.csproj FileClassification.Application/
+COPY FileClassification.Infrastructure/FileClassification.Infrastructure.csproj FileClassification.Infrastructure/
+COPY FileClassification.Worker/FileClassification.Worker.csproj FileClassification.Worker/
+COPY tests/FileClassification.UnitTests/FileClassification.UnitTests.csproj tests/FileClassification.UnitTests/
+
+RUN dotnet restore FileClassification.API/FileClassification.API.csproj
+
+COPY . .
+RUN dotnet publish FileClassification.API/FileClassification.API.csproj \
+    -c Release -o /app/publish --no-restore
+
+FROM mcr.microsoft.com/dotnet/aspnet:9.0
+WORKDIR /app
+COPY --from=build /app/publish .
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "FileClassification.API.dll"]
