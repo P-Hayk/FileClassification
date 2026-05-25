@@ -1,134 +1,194 @@
 # FileClassification
 
-A small .NET 9 service that ingests `.txt` files and classifies each one by its dominant
-language — Armenian, Russian, English, or Unknown. Files are uploaded over HTTP, stored
-in PostgreSQL as Large Objects, and processed by a background worker. There's no
-filesystem and no blob storage; the database is the only persistence layer.
+A .NET 9 distributed system that accepts `.txt` file uploads, stores them in PostgreSQL using the Large Object API, and classifies each file's primary language (Armenian, Russian, English, or Unknown) via a background worker.
 
-## Run it
+## Architecture
+
+The solution follows Clean Architecture and is split into four projects:
+
+```
+FileClassification.API          – ASP.NET Core REST API
+FileClassification.Worker       – .NET background worker service
+FileClassification.Application  – Domain logic, CQRS, interfaces
+FileClassification.Infrastructure – EF Core, Npgsql, PostgreSQL LO storage
+```
+
+### Component overview
+
+```
+┌─────────────┐    HTTP     ┌─────────────────────┐
+│   Client    │ ──────────► │  FileClassification  │
+│ (Browser /  │             │       .API           │
+│   Postman)  │             │  POST /api/files     │
+└─────────────┘             │  GET  /api/files     │
+                            │  GET  /api/files/{id}│
+                            │  PATCH ../cancel     │
+                            │  PATCH ../resume     │
+                            │  DELETE /api/files   │
+                            └──────────┬──────────┘
+                                       │ EF Core / Npgsql
+                            ┌──────────▼──────────┐
+                            │     PostgreSQL       │
+                            │  Files table         │
+                            │  Large Objects (LO)  │
+                            └──────────▲──────────┘
+                                       │ EF Core / Npgsql
+                            ┌──────────┴──────────┐
+                            │  FileClassification  │
+                            │      .Worker         │
+                            │                      │
+                            │  FileProcessingWorker│
+                            │  StalledFileReset-   │
+                            │       Worker         │
+                            └─────────────────────┘
+```
+
+### File state machine
+
+```
+            Upload
+              │
+              ▼
+          ┌─────────┐
+          │ Pending │◄─────────────────────────┐
+          └────┬────┘                           │
+               │ Worker claims                  │ StalledFileResetWorker
+               ▼                                │ (no heartbeat > timeout)
+          ┌──────────┐   Cancel   ┌──────────┐  │
+          │Processing│ ─────────► │ Inactive │  │
+          └────┬─────┘            └────┬─────┘  │
+               │                       │ Resume  │
+          ┌────┴────┐                  └─────────┘
+          │         │
+      Success    Failure
+          │         │
+          ▼         ▼
+     ┌─────────┐ ┌────────┐
+     │Completed│ │ Failed │
+     └─────────┘ └────────┘
+```
+
+## Projects
+
+### FileClassification.API
+
+ASP.NET Core Web API exposing file management endpoints. Uses **MediatR** to dispatch commands and queries to the Application layer.
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `POST` | `/api/files` | Upload a `.txt` file for classification |
+| `GET` | `/api/files` | List all files with their current state |
+| `GET` | `/api/files/{id}` | Get a single file record |
+| `PATCH` | `/api/files/{id}/cancel` | Cancel a file that is currently processing |
+| `PATCH` | `/api/files/{id}/resume` | Re-queue a cancelled (Inactive) file |
+| `DELETE` | `/api/files/{id}` | Delete a file (must not be Processing) |
+
+Interactive API docs are available at `/scalar/v1` (powered by Scalar).
+
+### FileClassification.Worker
+
+.NET Generic Host background service. Contains two hosted workers:
+
+**`FileProcessingWorker`** polls the database for `Pending` files, claims them atomically, and processes them concurrently up to `ConcurrencyLimit`. For each file it:
+1. Opens a read stream to the PostgreSQL Large Object.
+2. Runs the language classifier, reporting progress as it reads.
+3. Writes a heartbeat to the database on a fixed interval.
+4. Finalizes the record with `Completed` or `Failed` state and classification result.
+5. If the heartbeat detects the file is no longer active (externally cancelled), it stops processing without writing a final state.
+
+**`StalledFileResetWorker`** runs on the same poll interval and resets any file stuck in `Processing` state whose last heartbeat is older than `HeartbeatTimeoutSeconds` back to `Pending`.
+
+### FileClassification.Application
+
+Pure domain/application layer with no infrastructure dependencies.
+
+- **CQRS** via MediatR: commands (`UploadFile`, `CancelFile`, `ResumeFile`, `DeleteFile`) and queries (`GetAllFiles`, `GetFileById`).
+- **`LanguageDetector`**: character-range scanner that counts Armenian (U+0531–U+0587), Russian (Cyrillic U+0410–U+044F + Ё/ё), and English (A–Z, a–z) characters in a streaming pass. Reports the dominant language and its percentage share of classified characters. Returns `Unknown` if classified characters fall below `MinLanguageRatio`.
+- **`FileProcessingService`**: thin wrapper that calls the classifier and maps the result to a `ProcessingResult`.
+- **`FileWorkerService`**: thin wrapper delegating worker-side repository calls (claim, heartbeat, finalize, reset-stalled).
+- **`LoggingBehavior`**: MediatR pipeline behavior that logs every command/query.
+
+### FileClassification.Infrastructure
+
+- **`AppDbContext`** (EF Core + Npgsql): maps `FileRecord` to a `Files` table. `State` and `Language` columns stored as strings; `DataOid` stored as PostgreSQL `oid`.
+- **`FileRepository`**: all database operations, including Large Object management (create on upload, open-read on processing, unlink on delete). Worker claim uses an optimistic row-level update (`WHERE State = 'Pending'`) so multiple worker replicas cannot double-process the same file.
+- **`LargeObjectReadStream`**: wraps a Npgsql Large Object stream together with its owning connection and transaction, ensuring proper cleanup when the caller disposes the stream.
+
+## Language detection
+
+The classifier makes a single streaming pass over the file content using a `char[24576]` buffer. For each character it increments one of three language counters based on Unicode ranges:
+
+| Language | Unicode ranges |
+|----------|---------------|
+| Armenian | U+0531–U+0556 (uppercase), U+0561–U+0587 (lowercase) |
+| Russian | U+0410–U+044F (Cyrillic), U+0401 Ё, U+0451 ё |
+| English | A–Z, a–z |
+
+The dominant language is chosen by the highest count. If the total classified characters divided by total characters is below `MinLanguageRatio` (default `0.1`), the file is classified as `Unknown`.
+
+The confidence score is the dominant language's character count as a percentage of all classified characters.
+
+## Getting started
+
+### Prerequisites
+
+- [.NET 9 SDK](https://dotnet.microsoft.com/download)
+- [Docker](https://www.docker.com/) and Docker Compose
+
+### Run with Docker Compose
 
 ```bash
 docker compose up --build
 ```
 
-This starts Postgres, the API on `:8080`, and the worker. API docs (Scalar) at
-`http://localhost:8080/scalar/v1` in Development.
+This starts:
+- `postgres` — PostgreSQL 17 on port `5432`
+- `api` — REST API on port `8080`
+- `worker` — background classification worker
+- `frontend` — React UI on port `80` (built from `../../ReactProjects/folder-uploader`)
 
-Locally without Docker:
+The API is available at `http://localhost:8080`.  
+API docs (Scalar) are at `http://localhost:8080/scalar/v1`.
 
-```bash
-dotnet run --project FileClassification.API
-dotnet run --project FileClassification.Worker
-```
+### Run locally (without Docker)
 
-A Postgres on `localhost:5432` with a database called `fileclassification` is enough;
-schema is created on first start via `EnsureCreated` (this would be a migration in a
-real deployment).
+1. Start a local PostgreSQL instance and create a database named `fileclassification`.
+2. Update the connection string in `FileClassification.API/appsettings.Development.json` and `FileClassification.Worker/appsettings.Development.json` if needed.
+3. Run the API:
+   ```bash
+   dotnet run --project FileClassification.API
+   ```
+4. Run the worker in a second terminal:
+   ```bash
+   dotnet run --project FileClassification.Worker
+   ```
 
-## Endpoints
-
-| Method   | Route                       | Notes                                          |
-|----------|-----------------------------|------------------------------------------------|
-| `POST`   | `/api/files`                | Upload one `.txt` (multipart). Returns `{id}`. |
-| `GET`    | `/api/files`                | List everything with current state + progress. |
-| `GET`    | `/api/files/{id}`           | Single record.                                 |
-| `PATCH`  | `/api/files/{id}/cancel`    | Only valid while `Processing`.                 |
-| `PATCH`  | `/api/files/{id}/resume`    | Re-queue a `Inactive` or `Failed` file.        |
-| `DELETE` | `/api/files/{id}`           | Anything except `Processing`.                  |
-
-## How it works
-
-The API just persists. On upload it opens a transaction, creates a PostgreSQL Large
-Object, streams the request body into it, inserts the `Files` row referencing the
-`oid`, and commits. The HTTP request never buffers the whole file in memory.
-
-The worker polls `Files WHERE State='Pending'` and claims rows atomically using a
-single `UPDATE ... WHERE Id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING *` — so
-multiple worker replicas can run side-by-side without stepping on each other and
-without taking a table-level lock. Each claimed file is read back out of its Large
-Object as a stream and fed to `LanguageDetector`, which counts characters in three
-Unicode ranges in a single pass. The dominant language and its share of classified
-characters becomes the result.
-
-While a file is being classified the worker writes a heartbeat (the current progress
-percent) every few seconds. The heartbeat doubles as a cancellation channel: if the
-heartbeat UPDATE affects zero rows the file's state must have been changed externally
-(usually by `PATCH /cancel`), and the processing task cancels itself. A separate
-`StalledFileResetWorker` sweeps any row that's been in `Processing` longer than the
-heartbeat timeout back to `Pending`, so a crashed worker can't strand files.
-
-## Performance notes
-
-The whole pipeline is built around streaming, so the same code path works for a 1 KB
-text file and a 500 MB one. Uploads stream from the request body straight into the
-Large Object write; classification streams from the Large Object read straight
-through `StreamReader`. Nothing ever buffers a full file in memory.
-
-Workers claim their next batch in a single statement —
-`UPDATE … WHERE Id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING *`. Locked rows
-get skipped rather than waited on, so multiple worker replicas can grind through the
-queue side-by-side without taking a table-level lock and without a SELECT/UPDATE
-race. All state transitions (cancel, resume, heartbeat, finalise, stalled-reset) are
-single statements via `ExecuteUpdateAsync`; queries use `AsNoTracking`. Between those
-two, EF never sits in the hot path.
-
-Both the API and the worker share a singleton `NpgsqlDataSource`, which is also how
-the worker gets the dedicated connections it holds open while reading from a Large
-Object — so even the long-lived read paths are pooled.
-
-The classifier's inner loop rents a 16K-char buffer from `ArrayPool<char>`, iterates
-over a `ReadOnlySpan<char>` slice to drop bounds-checks, branches on three contiguous
-Unicode ranges (English first, since that's by far the most common path on real text),
-and only reports a progress update when the rounded percent actually changes. That
-last detail matters on a 500 MB file: without it, `IProgress<T>` gets called tens of
-thousands of times per second for no UI benefit.
-
-Worker concurrency per process is a `SemaphoreSlim` (default 4), and multiple worker
-processes can run side-by-side — the `SKIP LOCKED` claim keeps that race-free.
-
-What isn't here: there's no SignalR / WebSocket / SSE push. The UI polls
-`GET /api/files` while anything is active and stops when nothing is. With pagination
-on the API this scales fine; if it stopped scaling, `LISTEN/NOTIFY` or a SignalR hub
-would be the next move.
+The database schema is created automatically on API startup via `EnsureCreated`.
 
 ## Configuration
 
-Both services read connection strings, log sinks, and per-feature settings from their
-`appsettings.json`. The knobs worth knowing:
+### API — `appsettings.json`
 
-- `UploadLimits:MaxRequestBodySizeBytes` (API) — default 500 MB.
-- `LanguageDetector:MinLanguageRatio` (API + worker) — minimum share of classified
-  characters required to assign a language; below this the result is `Unknown`.
-- `WorkerSettings:ConcurrencyLimit` — parallel files per worker process. Default 4.
-- `WorkerSettings:PollIntervalSeconds` — how often the worker polls for new work and
-  how often the stalled-file sweeper runs. Default 2.
-- `WorkerSettings:ProgressUpdateIntervalSeconds` — heartbeat cadence. Default 3.
-- `WorkerSettings:HeartbeatTimeoutSeconds` — how long a heartbeat may go missing before
-  the file is considered stalled. Default 30.
+| Key | Default | Description |
+|-----|---------|-------------|
+| `ConnectionStrings:DefaultConnection` | `localhost` | PostgreSQL connection string |
+| `UploadLimits:MaxRequestBodySizeBytes` | `524288000` (500 MB) | Maximum upload size |
+| `LanguageDetector:MinLanguageRatio` | `0.1` | Minimum fraction of classified characters required to assign a language |
 
-## Tests
+### Worker — `appsettings.json`
 
-Two projects under `tests/`:
+| Key | Default | Description |
+|-----|---------|-------------|
+| `ConnectionStrings:DefaultConnection` | `localhost` | PostgreSQL connection string |
+| `WorkerSettings:ConcurrencyLimit` | `3` | Max files processed in parallel per worker instance |
+| `WorkerSettings:PollIntervalSeconds` | `10` | How often the worker polls for new files |
+| `WorkerSettings:ProgressUpdateIntervalSeconds` | `10` | Heartbeat interval |
+| `WorkerSettings:HeartbeatTimeoutSeconds` | `20` | Seconds without a heartbeat before a file is considered stalled |
 
-- `FileClassification.UnitTests` — fast, no infra. CQRS handlers, the language
-  detector, the processing service.
-- `FileClassification.IntegrationTests` — spins up real PostgreSQL via
-  [Testcontainers](https://dotnet.testcontainers.org/) and exercises `FileRepository`
-  against it: LO round-trip, state transitions, and a concurrency test that proves the
-  `SKIP LOCKED` claim actually partitions rows between simultaneous workers without
-  double-claiming.
+## Horizontal scaling
 
-```bash
-dotnet test                                                    # everything
-dotnet test tests/FileClassification.UnitTests                 # unit only
-dotnet test tests/FileClassification.IntegrationTests          # needs Docker
-```
+Multiple worker instances can run concurrently against the same database. The `ClaimPendingAsync` logic issues a per-row `UPDATE … WHERE State = 'Pending'` check so only one worker wins the claim for each file. The `StalledFileResetWorker` in each instance will independently reset files whose worker has died.
 
-## What's not in here
+## Logging
 
-Deliberately scoped out for this submission:
-
-- No authentication, no rate limiting, no CORS configuration.
-- `EnsureCreated` instead of EF migrations.
-- Scalar docs are Development-only.
-- No SignalR / SSE; the UI polls a single list endpoint.
+Both the API and the Worker use **Serilog** configured to write to the console and to a rolling daily log file at `logs/log-<date>.txt` (last 7 days retained).
